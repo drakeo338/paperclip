@@ -325,6 +325,9 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
 
     const updated = await services.issues.update({ issueId: issue.id, companyId, patch: { title: "b".repeat(300) } });
     expect(updated.title).toBe(`${"b".repeat(239)}\u2026`);
+
+    const emoji = await services.issues.create({ companyId, title: `${"c".repeat(238)}\u{1F600}${"d".repeat(10)}` });
+    expect(emoji.title).toBe(`${"c".repeat(238)}\u2026`);
   });
 
   it("creates plugin operation issues with the generic operation origin", async () => {

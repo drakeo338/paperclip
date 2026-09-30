@@ -1038,10 +1038,15 @@ export function buildHostServices(
     // Plugins generate titles from user-controlled names, so bound them
     // instead of failing after the plugin has already saved pending work.
     const trimmed = typeof title === "string" ? title.trim() : title;
-    const bounded =
-      typeof trimmed === "string" && trimmed.length > ISSUE_TITLE_MAX_LENGTH
-        ? `${trimmed.slice(0, ISSUE_TITLE_MAX_LENGTH - 1).trimEnd()}\u2026`
-        : trimmed;
+    let bounded = trimmed;
+    if (typeof trimmed === "string" && trimmed.length > ISSUE_TITLE_MAX_LENGTH) {
+      // The shared validator counts UTF-16 units, so keep the unit budget but
+      // never end on half of a surrogate pair.
+      let cut = ISSUE_TITLE_MAX_LENGTH - 1;
+      const last = trimmed.charCodeAt(cut - 1);
+      if (last >= 0xd800 && last <= 0xdbff) cut -= 1;
+      bounded = `${trimmed.slice(0, cut).trimEnd()}\u2026`;
+    }
     const parsed = issueTitleSchema.safeParse(bounded);
     if (!parsed.success) {
       throw new Error(`Invalid issue title: ${parsed.error.issues[0]?.message ?? "invalid value"}`);
