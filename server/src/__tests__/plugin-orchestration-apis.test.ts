@@ -311,20 +311,20 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
-  it("rejects plugin issue titles longer than the shared limit", async () => {
+  it("truncates plugin issue titles longer than the shared limit and rejects blank ones", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
 
-    await expect(
-      services.issues.create({ companyId, title: "a".repeat(241) }),
-    ).rejects.toThrow("Invalid issue title");
+    const long = await services.issues.create({ companyId, title: "a".repeat(500) });
+    expect(long.title).toBe(`${"a".repeat(239)}\u2026`);
 
     const issue = await services.issues.create({ companyId, title: `  ${"a".repeat(240)}  ` });
     expect(issue.title).toBe("a".repeat(240));
 
-    await expect(
-      services.issues.update({ issueId: issue.id, companyId, patch: { title: "b".repeat(241) } }),
-    ).rejects.toThrow("Invalid issue title");
+    await expect(services.issues.create({ companyId, title: "   " })).rejects.toThrow("Invalid issue title");
+
+    const updated = await services.issues.update({ issueId: issue.id, companyId, patch: { title: "b".repeat(300) } });
+    expect(updated.title).toBe(`${"b".repeat(239)}\u2026`);
   });
 
   it("creates plugin operation issues with the generic operation origin", async () => {

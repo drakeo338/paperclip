@@ -28,7 +28,7 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { issueTitleSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { ISSUE_TITLE_MAX_LENGTH, issueTitleSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -1035,7 +1035,14 @@ export function buildHostServices(
 
   const defaultPluginOriginKind = `plugin:${pluginKey}`;
   const normalizePluginIssueTitle = (title: unknown) => {
-    const parsed = issueTitleSchema.safeParse(title);
+    // Plugins generate titles from user-controlled names, so bound them
+    // instead of failing after the plugin has already saved pending work.
+    const trimmed = typeof title === "string" ? title.trim() : title;
+    const bounded =
+      typeof trimmed === "string" && trimmed.length > ISSUE_TITLE_MAX_LENGTH
+        ? `${trimmed.slice(0, ISSUE_TITLE_MAX_LENGTH - 1).trimEnd()}\u2026`
+        : trimmed;
+    const parsed = issueTitleSchema.safeParse(bounded);
     if (!parsed.success) {
       throw new Error(`Invalid issue title: ${parsed.error.issues[0]?.message ?? "invalid value"}`);
     }
