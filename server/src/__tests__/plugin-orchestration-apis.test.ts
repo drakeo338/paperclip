@@ -311,6 +311,22 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
+  it("rejects plugin issue titles longer than the shared limit", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.create({ companyId, title: "a".repeat(241) }),
+    ).rejects.toThrow("Invalid issue title");
+
+    const issue = await services.issues.create({ companyId, title: `  ${"a".repeat(240)}  ` });
+    expect(issue.title).toBe("a".repeat(240));
+
+    await expect(
+      services.issues.update({ issueId: issue.id, companyId, patch: { title: "b".repeat(241) } }),
+    ).rejects.toThrow("Invalid issue title");
+  });
+
   it("creates plugin operation issues with the generic operation origin", async () => {
     const { companyId } = await seedCompanyAndAgent();
     const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());

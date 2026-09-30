@@ -28,7 +28,7 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { issueTitleSchema, pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -1034,6 +1034,14 @@ export function buildHostServices(
   };
 
   const defaultPluginOriginKind = `plugin:${pluginKey}`;
+  const normalizePluginIssueTitle = (title: unknown) => {
+    const parsed = issueTitleSchema.safeParse(title);
+    if (!parsed.success) {
+      throw new Error(`Invalid issue title: ${parsed.error.issues[0]?.message ?? "invalid value"}`);
+    }
+    return parsed.data;
+  };
+
   const normalizePluginOriginKind = (originKind: unknown = defaultPluginOriginKind) => {
     if (originKind == null || originKind === "") return defaultPluginOriginKind;
     if (typeof originKind !== "string") {
@@ -1923,6 +1931,7 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          title: normalizePluginIssueTitle(issueInput.title),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
@@ -1961,6 +1970,9 @@ export function buildHostServices(
         delete patch.actorRunId;
         if (patch.originKind !== undefined) {
           patch.originKind = normalizePluginOriginKind(patch.originKind);
+        }
+        if (patch.title !== undefined) {
+          patch.title = normalizePluginIssueTitle(patch.title);
         }
         const updated = (await issues.update(params.issueId, {
           ...(patch as any),
