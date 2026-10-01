@@ -2813,7 +2813,15 @@ function skipYamlFlowWhitespace(input: string, index: number) {
   return next;
 }
 
-function readYamlFlowNode(input: string, start: number, isKey: boolean): { value: unknown; end: number } {
+const YAML_FLOW_MAX_DEPTH = 64;
+
+function readYamlFlowNode(
+  input: string,
+  start: number,
+  isKey: boolean,
+  depth = 0,
+): { value: unknown; end: number } {
+  if (depth > YAML_FLOW_MAX_DEPTH) throw new YamlFlowParseError("YAML flow collection is nested too deeply");
   const index = skipYamlFlowWhitespace(input, start);
   const char = input[index];
   if (char === "\"") return readYamlDoubleQuoted(input, index);
@@ -2822,7 +2830,7 @@ function readYamlFlowNode(input: string, start: number, isKey: boolean): { value
     const items: unknown[] = [];
     let cursor = skipYamlFlowWhitespace(input, index + 1);
     while (input[cursor] !== "]") {
-      const item = readYamlFlowNode(input, cursor, false);
+      const item = readYamlFlowNode(input, cursor, false, depth + 1);
       items.push(item.value);
       cursor = skipYamlFlowWhitespace(input, item.end);
       if (input[cursor] === ",") cursor = skipYamlFlowWhitespace(input, cursor + 1);
@@ -2834,10 +2842,10 @@ function readYamlFlowNode(input: string, start: number, isKey: boolean): { value
     const record: Record<string, unknown> = {};
     let cursor = skipYamlFlowWhitespace(input, index + 1);
     while (input[cursor] !== "}") {
-      const key = readYamlFlowNode(input, cursor, true);
+      const key = readYamlFlowNode(input, cursor, true, depth + 1);
       cursor = skipYamlFlowWhitespace(input, key.end);
       if (input[cursor] !== ":") throw new YamlFlowParseError("Expected : in YAML flow mapping");
-      const value = readYamlFlowNode(input, cursor + 1, false);
+      const value = readYamlFlowNode(input, cursor + 1, false, depth + 1);
       record[String(key.value)] = value.value;
       cursor = skipYamlFlowWhitespace(input, value.end);
       if (input[cursor] === ",") cursor = skipYamlFlowWhitespace(input, cursor + 1);
@@ -2873,7 +2881,7 @@ function parseYamlScalar(rawValue: string): unknown {
   if (trimmed === "false") return false;
   if (trimmed === "[]") return [];
   if (trimmed === "{}") return {};
-  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
+  if (/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(trimmed)) return Number(trimmed);
   if (
     trimmed.startsWith("\"") ||
     trimmed.startsWith("[") ||
