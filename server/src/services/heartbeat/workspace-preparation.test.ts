@@ -1,9 +1,12 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile, access } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile, access, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issues, projects, projectWorkspaces, type Db } from "@paperclipai/db";
+import { captureDirectorySnapshot, directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, executionWorkspaces, executionWorkspaceRepositoryAccess, heartbeatRuns, issues, issueAccessGrants, plugins, projects, projectWorkspaces, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -11,10 +14,20 @@ import { environmentRunOrchestrator } from "../environment-run-orchestrator.js";
 import { environmentService } from "../environments.js";
 import { executionWorkspaceService } from "../execution-workspaces.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { issueService } from "../issues.js";
 import { workspaceOperationService } from "../workspace-operations.js";
-import { createHeartbeatWorkspaceResolver, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
+import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
+import { createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
 import { prepareHeartbeatWorkspace, type HeartbeatWorkspacePreparationInput } from "./workspace-preparation.js";
+import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
+import * as managedRepositoryCheckout from "../managed-repository-checkout.js";
+import { isolatedRemoteSourcePath } from "../isolated-remote-workspace-source.js";
+import { cleanupExecutionWorkspaceArtifacts } from "../workspace-runtime.js";
+import { trace } from "@opentelemetry/api";
+import { buildExecutionWorkspaceAdapterConfig } from "../execution-workspace-policy.js";
+import { createLocalDiskStorageProvider } from "../../storage/local-disk-provider.js";
+import { createStorageService } from "../../storage/service.js";
+import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 
 const execFile = promisify(execFileCallback);
 const support = await getEmbeddedPostgresTestSupport();
@@ -63,7 +76,7 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     const resolver = createHeartbeatWorkspaceResolver(db);
     const input: HeartbeatWorkspacePreparationInput = {
       run, agent,
-      task: { issueRef: issue, issueId: issue.id, context: { issueId: issue.id, projectId: project.id }, executionProjectId: project.id, responsibleUserId: null, previousSessionParams: null },
+      task: { issueRef: issue, issueId: issue.id, context: { issueId: issue.id, projectId: project.id }, responsibleUserId: null, previousSessionParams: null },
       policy: {
         trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
         isolatedWorkspacesEnabled: true,
@@ -76,14 +89,101 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
       environment: { selectedEnvironmentId: localEnvironment.id, localEnvironment, selectedEnvironmentForConfig: localEnvironment, environmentResolution: { environmentId: localEnvironment.id, source: "default" }, resolvedInstanceSettings: await instanceSettingsService(db).get() },
       config: { mergedConfig: isolated ? { workspaceStrategy: { type: "git_worktree", baseRef: "main", branchTemplate: "test-{{issue.identifier}}" } } : {}, configSnapshot: null, secretManifest: [] },
       reuse: { requestedShouldReuseExisting: false, existingExecutionWorkspace: null, reusableExistingExecutionWorkspace: null, workspaceReuseRequest: resolveExecutionWorkspaceReuseRequestForIssue({ issueExecutionWorkspaceId: null, issueExecutionWorkspacePreference: null, existingExecutionWorkspaceStatus: null }), nativeRecoveryExecutionWorkspaceId: null, persistedNativeExecutionInput: null, isDotRun: false, runOptions: {} },
-      services: { envOrchestrator, executionWorkspacesSvc: executionWorkspaceService(db), workspaceOperationsSvc: workspaceOperationService(db), issuesSvc: issueService(db), ...resolver, appendRunEvent: vi.fn() },
+      services: { envOrchestrator, executionWorkspacesSvc: executionWorkspaceService(db), workspaceOperationsSvc: workspaceOperationService(db), ...resolver, appendRunEvent: vi.fn() },
       controllerLease: { assertOwned: vi.fn(async () => {}) }, nativeRunnerPreparationSpans: [],
     };
     return { input, source, issue, run, envOrchestrator };
   }
+  it("prepares managed storage before acquisition without touching a Core checkout", async () => {
+    const { input, source, issue } = await fixture(true);
+    const [plugin] = await db.insert(plugins).values({ pluginKey: "test.managed-storage", packageName: "test-storage", version: "1.0.0", apiVersion: 1, status: "ready", categories: ["workspace"],
+      manifestJson: { id: "test.managed-storage", apiVersion: 1, version: "1.0.0", displayName: "Storage", description: "Storage", author: "Test", categories: ["workspace"],
+        workspaceProvider: { modes: ["isolated_workspace", "operator_branch"], strategies: ["git_worktree"] }, capabilities: ["workspaces.manage", "events.subscribe"], resourceLifecycle: ["project"], entrypoints: { worker: "./worker.js" } } }).returning();
+    await db.update(projects).set({ executionWorkspacePolicy: { enabled: true, storageProviderPluginId: plugin.id } }).where(eq(projects.id, issue.projectId!));
+    await db.update(projectWorkspaces).set({ cwd: null, sourceType: "remote_managed", repoUrl: "https://github.com/example/repo.git" }).where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    await rm(source, { recursive: true });
+    const sequence: string[] = [];
+    input.services.workspaceWorkers = { getWorker: () => ({ supportedMethods: ["workspaceOperation"] }), call: async (_: string, __: string, params: any) => {
+      sequence.push("prepare");
+      return { kind: "prepared", binding: { pluginId: plugin.id, projectId: issue.projectId, executionWorkspaceId: params.executionWorkspaceId,
+        projectWorkspaceId: issue.projectWorkspaceId, sourceRevision: params.operation.source.revision, workspaceRef: "provider:checkout" },
+        branchName: params.operation.branchName, baseSha: "a".repeat(40), created: true, branchCreatedByRuntime: true };
+    } } as any;
+    const acquire = input.services.envOrchestrator.acquireForRun;
+    vi.spyOn(input.services.envOrchestrator, "acquireForRun").mockImplementation(async args => {
+      sequence.push("acquire"); expect(args.persistedExecutionWorkspace).toMatchObject({ providerType: "plugin", cwd: null });
+      return acquire(args);
+    });
+    vi.spyOn(input.services.envOrchestrator, "realizeForRun").mockImplementation(async args => {
+      expect(args.executionWorkspace.providerBinding?.workspaceRef).toBe("provider:checkout");
+      throw new Error("reached execution handoff");
+    });
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("reached execution handoff");
+    expect(sequence).toEqual(["prepare", "acquire"]);
+    await expect(access(source)).rejects.toThrow();
+    const [task] = await db.select().from(issues).where(eq(issues.id, issue.id));
+    const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, task.executionWorkspaceId!));
+    expect(workspace).toMatchObject({ providerType: "plugin", cwd: null, branchName: "test-WSP-1" });
+  });
   const readIssue = (id: string) => db.select().from(issues).where(eq(issues.id, id)).then(rows => rows[0]!);
   const readRun = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const leases = (id: string) => db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, id));
+
+  it("keeps plugin-owned storage untouched when a fresh attempt cannot import preserved files", async () => {
+    const { input, source, issue } = await fixture(true);
+    await db.update(projects).set({ executionWorkspacePolicy: {
+      enabled: true, storageProviderPluginId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    } }).where(eq(projects.id, issue.projectId!));
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    const call = vi.fn();
+    input.services.workspaceWorkers = { getWorker: () => ({ supportedMethods: ["workspaceOperation"] }), call } as any;
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toMatchObject({
+      resultJson: { reason: "fresh_workspace_storage_unsupported" },
+    });
+    expect(call).not.toHaveBeenCalled();
+    expect(await leases(input.run.id)).toHaveLength(0);
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
+    expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
+  });
+
+  it("a fresh retry creates independent files and Git storage instead of reopening a configured task branch", async () => {
+    const { input, source, issue } = await fixture(true);
+    const original = await prepareHeartbeatWorkspace(db, input);
+    await writeFile(join(original.executionWorkspace.cwd, "unpublished.txt"), "keep the old work\n");
+    const [nextRun] = await db.insert(heartbeatRuns).values({ companyId: input.run.companyId,
+      agentId: input.agent.id, issueId: issue.id, scopeKind: "issue", status: "running", runtimeMode: "legacy" }).returning();
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: nextRun.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    input.run = nextRun;
+    input.task.issueRef = { ...issue, executionWorkspaceId: null, executionWorkspacePreference: "create_new" };
+    const replacement = await prepareHeartbeatWorkspace(db, input);
+    expect(replacement.persistedExecutionWorkspace!.id).not.toBe(original.persistedExecutionWorkspace!.id);
+    expect(replacement.executionWorkspace.cwd).not.toBe(original.executionWorkspace.cwd);
+    expect(replacement.executionWorkspace.cwd).not.toBe(source);
+    expect(await readFile(join(replacement.executionWorkspace.cwd, "README.md"), "utf8")).toBe("source content\n");
+    expect(await readFile(join(original.executionWorkspace.cwd, "unpublished.txt"), "utf8")).toBe("keep the old work\n");
+    const common = await execFile("git", ["-C", replacement.executionWorkspace.cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    expect(common.stdout.trim()).toBe(join(replacement.executionWorkspace.cwd, ".git"));
+    await expect(access(join(replacement.executionWorkspace.cwd, "unpublished.txt"))).rejects.toThrow();
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(replacement.persistedExecutionWorkspace!.id);
+  }, 30_000);
+
+  it("starts a fresh clean task directory without treating it as a Git source", async () => {
+    const { input, source, issue } = await fixture();
+    input.policy.useIsolatedTaskDirectory = true;
+    input.policy.effectiveExecutionWorkspaceMode = "isolated_workspace";
+    input.policy.requestedExecutionWorkspaceMode = "isolated_workspace";
+    input.task.freshWorkspace = { mode: "fresh_isolated_workspace", retryIntentId: input.run.id,
+      sourceRunId: input.run.id, retainedSourceIds: [] };
+    const prepared = await prepareHeartbeatWorkspace(db, input);
+    expect(prepared.executionWorkspace.cwd).toContain("/isolated-workspace-attempts/");
+    expect(prepared.executionWorkspace.cwd).toContain(`/${input.run.id}`);
+    expect(prepared.executionWorkspace.cwd).not.toBe(source);
+    await expect(access(join(prepared.executionWorkspace.cwd, "README.md"))).rejects.toThrow();
+    expect(await readFile(join(source, "README.md"), "utf8")).toBe("source content\n");
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(prepared.persistedExecutionWorkspace!.id);
+  });
 
   async function reuse(input: HeartbeatWorkspacePreparationInput, workspace: NonNullable<Awaited<ReturnType<typeof prepareHeartbeatWorkspace>>["persistedExecutionWorkspace"]>) {
     input.reuse.requestedShouldReuseExisting = true;
@@ -94,6 +194,67 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     const [run] = await db.insert(heartbeatRuns).values({ companyId: input.run.companyId, agentId: input.agent.id, issueId: input.task.issueId, scopeKind: "issue", status: "running", runtimeMode: "legacy" }).returning();
     input.run = run;
   }
+
+  async function persistRecoveryInput(input: HeartbeatWorkspacePreparationInput, workspaceId: string, cwd: string) {
+    const issue = await readIssue(input.task.issueId!);
+    const admitted = buildNativeExecutionInput({ companyId: input.agent.companyId, agentId: input.agent.id,
+      runId: input.run.id, provider: "codex",
+      issue: { id: issue.id, identifier: issue.identifier, title: issue.title, description: null, workMode: "standard" },
+      taskPrompt: "Continue admitted task", normalizedSessionId: null,
+      workspace: { id: workspaceId, cwd, repoUrl: null, repoRef: null, branchName: null },
+      completionContract: { id: input.run.id, sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Continue admitted task", criteria: [{ id: "objective", requirement: "Finish" }] } },
+      runtimeContext: nativeRuntimeContextFixture(),
+    });
+    input.run.runtimeMode = "native";
+    input.run.nativeIssueId = issue.id;
+    input.run.runnerProfileJson = { nativeExecutionInput: admitted };
+    input.reuse.persistedNativeExecutionInput = admitted;
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issue.id,
+      runnerProfileJson: input.run.runnerProfileJson }).where(eq(heartbeatRuns.id, input.run.id));
+    return admitted;
+  }
+
+  it.each(["muse", "openai_dot", "grok_bot"] as const)("uses private %s controller storage without rebinding task files or preparing repositories", async provider => {
+    const { input, issue } = await fixture();
+    input.agent.adapterType = "paperclip_runner";
+    input.config.mergedConfig = { provider, cwd: "/task/source/must-not-be-read", workspaceStrategy: { type: "git_worktree" } };
+    input.reuse.isDotRun = true;
+    const resolve = vi.spyOn(input.services, "resolveWorkspaceForRun").mockRejectedValue(new Error("Task files must not be adopted"));
+    const bind = vi.spyOn(input.services.executionWorkspacesSvc, "bindTaskWorkspace").mockRejectedValue(new Error("Task binding must not change"));
+    const repos = vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission").mockRejectedValue(new Error("Repositories must not be prepared"));
+    try {
+      const result = await prepareHeartbeatWorkspace(db, input);
+      expect(result.executionWorkspace.cwd).toContain(provider === "muse" ? "muse-controllers" : "dot-controllers");
+      expect(result.persistedExecutionWorkspace).toBeNull();
+      expect(result.projectRepositoryPaths).toEqual([]);
+      expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
+      expect(resolve).not.toHaveBeenCalled();
+      expect(bind).not.toHaveBeenCalled();
+      expect(repos).not.toHaveBeenCalled();
+      const binding = { companyId: input.agent.companyId, agentId: input.agent.id, bindingId: input.run.id,
+        bindingGeneration: 1, acceptByUnixMs: Date.now() + 60_000, expiresAtUnixMs: Date.now() + 600_000 };
+      const admitted = buildNativeExecutionInput({ companyId: input.agent.companyId, agentId: input.agent.id,
+        runId: input.run.id, provider, ...(provider === "muse" ? { museBinding: binding } : { dotBinding: binding }),
+        issue: { id: issue.id, identifier: null, title: issue.title, description: null, workMode: "standard" },
+        taskPrompt: "Preserve the admitted controller", normalizedSessionId: input.run.id,
+        workspace: { id: input.run.id, cwd: result.executionWorkspace.cwd, repoUrl: null, repoRef: null, branchName: null },
+        completionContract: { id: input.run.id, sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+          contract: { revision: "1", objective: "Preserve the controller", criteria: [{ id: "objective", requirement: "Preserve the original checkpoint path" }] } },
+        runtimeContext: nativeRuntimeContextFixture(),
+      });
+      input.reuse.persistedNativeExecutionInput = admitted;
+      input.run.runtimeMode = "native";
+      input.run.runnerProfileJson = { nativeExecutionInput: admitted };
+      input.config.mergedConfig = { provider: "codex" };
+      const recovered = await prepareHeartbeatWorkspace(db, input);
+      expect(recovered.executionWorkspace.cwd).toBe(result.executionWorkspace.cwd);
+      expect(recovered.persistedExecutionWorkspace).toBeNull();
+      expect(bind).not.toHaveBeenCalled();
+      expect(repos).not.toHaveBeenCalled();
+
+    } finally { resolve.mockRestore(); bind.mockRestore(); repos.mockRestore(); }
+  });
 
   it("persists the workspace and issue binding before acquiring its environment", async () => {
     const { input, source, issue, envOrchestrator } = await fixture();
@@ -108,7 +269,223 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     expect(result.persistedExecutionWorkspace).toMatchObject({ companyId: issue.companyId, projectId: issue.projectId, projectWorkspaceId: issue.projectWorkspaceId, mode: "shared_workspace" });
     expect(await leases(input.run.id)).toMatchObject([{ status: "active", executionWorkspaceId: result.persistedExecutionWorkspace!.id }]);
     expect(input.nativeRunnerPreparationSpans.map(span => span.name)).toEqual(["environment.acquire", "environment.workspace.realize"]);
+    expect(input.nativeRunnerPreparationSpans.every(span => span.parentName === "task.provider_session")).toBe(true);
     expect(input.controllerLease.assertOwned).toHaveBeenCalledTimes(2);
+  });
+
+  it("records workspace steps around real persistence before environment acquisition", async () => {
+    const { input, source, issue, envOrchestrator } = await fixture();
+    const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
+    const exporter = new InMemorySpanExporter();
+    const provider = new TracerProvider({ spanProcessors: [new SimpleSpanProcessor({ exporter })] });
+    expect(trace.setGlobalTracerProvider(provider)).toBe(true);
+    const acquire = envOrchestrator.acquireForRun;
+    vi.spyOn(envOrchestrator, "acquireForRun").mockImplementation(async args => {
+      const names = exporter.getFinishedSpans().map(span => span.name);
+      expect(names).toContain("heartbeat.prepare.workspace_record_create");
+      expect(names).toContain("heartbeat.prepare.workspace_binding");
+      expect((await readIssue(issue.id)).executionWorkspaceId).toBe(args.persistedExecutionWorkspace?.id);
+      return acquire(args);
+    });
+    try {
+      const result = await prepareHeartbeatWorkspace(db, input);
+      expect(result.executionWorkspace.cwd).toBe(source);
+      await provider.forceFlush();
+      const spans = exporter.getFinishedSpans();
+      expect(spans.map(span => span.name)).toEqual(expect.arrayContaining([
+        "heartbeat.prepare.workspace_source_resolution",
+        "heartbeat.prepare.workspace_provision_policy",
+        "heartbeat.prepare.workspace_base_validation",
+        "heartbeat.prepare.workspace_provision",
+        "heartbeat.prepare.workspace_operation_binding",
+        "heartbeat.prepare.workspace_config_recording",
+        "heartbeat.prepare.workspace_repository_admission",
+        "heartbeat.prepare.workspace_project_repositories",
+      ]));
+      for (const span of spans) {
+        expect(Object.keys(span.attributes)).toEqual(["paperclip.task.run.run_id"]);
+        expect(JSON.stringify(span.attributes)).not.toContain(source);
+      }
+    } finally {
+      vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
+      trace.disable();
+      await provider.shutdown();
+    }
+  });
+
+  it("prepares, reuses, and reopens a selected source containing an inaccessible private worktree", async () => {
+    const { input, source, issue } = await fixture(true);
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    const [privateIssue] = await db.insert(issues).values({ companyId: issue.companyId,
+      title: "Private historical task", visibility: "private", projectId: issue.projectId }).returning();
+    const privateCwd = join(source, "private-work");
+    await execFile("git", ["-C", source, "worktree", "add", "-b", "historical-private", privateCwd, "main"]);
+    await writeFile(join(privateCwd, "confidential.txt"), "Shared OS storage is not task authorization");
+    const [privateWorkspace] = await db.insert(executionWorkspaces).values({ companyId: issue.companyId,
+      name: "Private workspace", sourceIssueId: privateIssue.id, cwd: privateCwd,
+      mode: "isolated_workspace", strategyType: "git_worktree", providerType: "git_worktree",
+      providerRef: privateCwd, branchName: "historical-private", status: "idle" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: privateWorkspace.id }).where(eq(issues.id, privateIssue.id));
+    const clone = vi.spyOn(managedRepositoryCheckout, "materializeManagedProjectWorkspace");
+    const result = await prepareHeartbeatWorkspace(db, input);
+    expect(result.executionWorkspace.baseCwd).toBe(source);
+    expect(result.persistedExecutionWorkspace!.metadata?.isolatedRemoteSource).toBeUndefined();
+    expect(await readFile(join(result.executionWorkspace.cwd, "README.md"), "utf8")).toBe("source content\n");
+    expect(clone).not.toHaveBeenCalled();
+    await expect(access(isolatedRemoteSourcePath(issue.companyId, issue.id))).rejects.toMatchObject({ code: "ENOENT" });
+    await writeFile(join(result.executionWorkspace.cwd, "unpublished-work.txt"), "Keep current task edits\n");
+    await reuse(input, result.persistedExecutionWorkspace!);
+    const resumed = await prepareHeartbeatWorkspace(db, input);
+    expect(resumed.persistedExecutionWorkspace!.id).toBe(result.persistedExecutionWorkspace!.id);
+    expect(await readFile(join(resumed.executionWorkspace.cwd, "unpublished-work.txt"), "utf8")).toBe("Keep current task edits\n");
+    const workspace = resumed.persistedExecutionWorkspace!;
+    const cleanup = await cleanupExecutionWorkspaceArtifacts({ workspace,
+      projectWorkspace: { cwd: source, cleanupCommand: null }, runCleanupCommands: false });
+    expect(cleanup.warnings).toEqual([]);
+    await db.update(executionWorkspaces).set({ status: "archived" }).where(eq(executionWorkspaces.id, workspace.id));
+    const reopened = await executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({ workspaceId: workspace.id,
+      issue: { id: issue.id, companyId: issue.companyId, projectId: issue.projectId },
+      actor: { agentId: input.agent.id, actorType: "agent" },
+      authorizationActor: { type: "agent", source: "agent_jwt", agentId: input.agent.id, companyId: issue.companyId, runId: input.run.id },
+    });
+    expect(reopened).toMatchObject({ ok: true });
+    expect(await readFile(join(workspace.cwd!, "README.md"), "utf8")).toBe("source content\n");
+    expect(await readFile(join(privateCwd, "confidential.txt"), "utf8")).toContain("OS storage");
+  });
+
+  it("cleans up a new local worktree after workspace persistence fails", async () => {
+    const { input, source, issue } = await fixture(true);
+    vi.spyOn(input.services.executionWorkspacesSvc, "create").mockRejectedValueOnce(new Error("Workspace persistence failed"));
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Workspace persistence failed");
+    const worktrees = (await execFile("git", ["-C", source, "worktree", "list", "--porcelain"])).stdout;
+    expect(worktrees.match(/^worktree /gm)).toHaveLength(1);
+    await expect(execFile("git", ["-C", source, "rev-parse", "--verify", `refs/heads/test-${issue.identifier}`])).rejects.toBeDefined();
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
+  });
+
+  it.each(["sandbox", "ssh", "local", null] as const)("uses the selected %s placement for controller provisioning", async driver => {
+    const { input, source, issue, envOrchestrator } = await fixture(true);
+    const marker = join(source, "host-provision-ran");
+    const provisionCommand = `printf host > '${marker}'`;
+    input.config.mergedConfig = { workspaceStrategy: { type: "git_worktree", provisionCommand, runtimeProvisionCommand: "printf runtime" } };
+    const originalConfig = structuredClone(input.config.mergedConfig);
+    input.environment.selectedEnvironmentForConfig = driver === null ? null : { ...input.environment.localEnvironment, driver };
+    const stopped = new Error("Fixture stops before transport acquisition");
+    vi.spyOn(envOrchestrator, "acquireForRun").mockRejectedValue(stopped);
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toBe(stopped);
+    const bound = await readIssue(issue.id);
+    const [workspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, bound.executionWorkspaceId!));
+    expect(await readFile(join(workspace.cwd!, "README.md"), "utf8")).toBe("source content\n");
+    if (driver === "sandbox" || driver === "ssh") await expect(readFile(marker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    else expect(await readFile(marker, "utf8")).toBe("host");
+    expect(input.config.mergedConfig).toEqual(originalConfig);
+  });
+
+  it("checks current repository admission before publishing configured sibling repositories", async () => {
+    const { input, source, issue } = await fixture();
+    await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: issue.projectId!,
+      name: "Sibling repository", repoUrl: pathToFileURL(source).href });
+    vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission")
+      .mockRejectedValue(new Error("Current run identity is unavailable"));
+    const acquire = vi.spyOn(input.services.envOrchestrator, "acquireForRun");
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Current run identity is unavailable");
+    await expect(access(join(source, ".paperclip-repositories"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
+  it("rechecks current binding after configured clone and before publication", async () => {
+    const { input, source, issue } = await fixture();
+    await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: issue.projectId!,
+      name: "Sibling repository", repoUrl: pathToFileURL(source).href });
+    const namespace = join(source, ".paperclip-repositories");
+    const guard = vi.spyOn(input.services.executionWorkspacesSvc, "assertTaskRepositoryPublicationAllowed")
+      .mockImplementation(async () => {
+        const candidates = await readdir(namespace);
+        expect(candidates).toHaveLength(1);
+        expect(candidates[0]).toContain(".clone-");
+        expect(await readFile(join(namespace, candidates[0]!, "README.md"), "utf8")).toBe("source content\n");
+        throw new Error("Task binding changed during clone");
+      });
+    await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow("Task binding changed during clone");
+    expect(guard).toHaveBeenCalledOnce();
+    expect(await readdir(namespace)).toEqual([]);
+    expect(await leases(input.run.id)).toEqual([]);
+  });
+
+  it("rejects a configured sibling copy when its source disappears before publication", async () => {
+    const previousPrivacyMode = process.env.PAPERCLIP_ISSUE_PRIVACY_MODE;
+    vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", "enforce");
+    try {
+      const { input, source, issue } = await fixture();
+      const sibling = source + "-private-sibling";
+      await execFile("git", ["clone", "--no-hardlinks", source, sibling]);
+      await writeFile(join(sibling, "private.txt"), "PRIVATE_SIBLING_STAGING_BYTES");
+      const [privateIssue] = await db.insert(issues).values({ companyId: issue.companyId, title: "Private sibling owner",
+        visibility: "private", responsibleUserId: "private-owner" }).returning();
+      const [privateWorkspace] = await db.insert(executionWorkspaces).values({ companyId: issue.companyId,
+        name: "Private sibling", projectId: null, sourceIssueId: privateIssue.id, cwd: sibling,
+        providerType: "local_fs", strategyType: "project_primary", mode: "shared_workspace", status: "active" }).returning();
+      await db.insert(issueAccessGrants).values({ issueId: privateIssue.id, subjectType: "agent", subjectId: input.agent.id, source: "explicit" });
+      const [configured] = await db.insert(projectWorkspaces).values({ companyId: issue.companyId, projectId: issue.projectId!,
+        name: "Private sibling", cwd: sibling, repoUrl: pathToFileURL(sibling).href }).returning();
+      const namespace = join(source, ".paperclip-repositories");
+      const originalPrepare = input.services.executionWorkspacesSvc.prepareConfiguredRepositoryCopy;
+      const prepare = vi.spyOn(input.services.executionWorkspacesSvc, "prepareConfiguredRepositoryCopy").mockImplementation(async args => {
+        const recheck = await originalPrepare(args);
+        return async () => {
+          const candidates = await readdir(namespace);
+          expect(candidates).toHaveLength(1);
+          expect(candidates[0]).toContain(".clone-");
+          expect(await readFile(join(namespace, candidates[0]!, "private.txt"), "utf8")).toBe("PRIVATE_SIBLING_STAGING_BYTES");
+          const retained = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, issue.companyId));
+          expect(retained).toEqual([]);
+          await rename(sibling, sibling + "-moved");
+          await db.update(projectWorkspaces).set({ cwd: sibling + "-moved" }).where(eq(projectWorkspaces.id, configured.id));
+          await recheck();
+        };
+      });
+      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow(/ENOENT|unavailable|inaccessible|no longer/i);
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(await readdir(namespace)).toEqual([]);
+      expect(await leases(input.run.id)).toEqual([]);
+      await db.delete(issueAccessGrants).where(eq(issueAccessGrants.issueId, privateIssue.id));
+
+    } finally {
+      vi.stubEnv("PAPERCLIP_ISSUE_PRIVACY_MODE", previousPrivacyMode);
+    }
+  });
+
+  it.each(["file://untrusted-host/private/repository", "file:///private%2Frepository", "file:///private/repository?other", "file:///private/repository#other"])("rejects malformed local repository URL before source access: %s", async repoUrl => {
+    const { source, issue } = await fixture();
+    const prepareLocalSource = vi.fn();
+    await expect(prepareProjectRepositoryWorkspaces({ cwd: source, anchorRepoUrl: null,
+      workspaces: [{ id: issue.projectWorkspaceId!, repoUrl, repoRef: null, cwd: null }], prepareLocalSource })).rejects.toThrow();
+    expect(prepareLocalSource).not.toHaveBeenCalled();
+    expect(await readdir(join(source, ".paperclip-repositories"))).toEqual([]);
+  });
+
+  it("persists and reuses task-owned files without adopting the organizational project as their source", async () => {
+    const { input, issue } = await fixture();
+    await db.update(issues).set({ projectWorkspaceId: null,
+      workspaceSelection: { version: 1, source: "explicit", selection: { kind: "task_directory" } },
+    }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
+    const bind = vi.spyOn(input.services.executionWorkspacesSvc, "bindTaskWorkspace");
+    const first = await prepareHeartbeatWorkspace(db, input);
+    expect(first.persistedExecutionWorkspace).toMatchObject({ projectId: null, projectWorkspaceId: null, sourceIssueId: issue.id });
+    expect(bind).toHaveBeenCalled();
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBe(first.persistedExecutionWorkspace!.id);
+    await writeFile(join(first.executionWorkspace.cwd, "retained.txt"), "task files");
+    const [organization] = await db.insert(projects).values({ companyId: issue.companyId, name: "New organization" }).returning();
+    await db.update(issues).set({ projectId: organization.id }).where(eq(issues.id, issue.id));
+    input.task.issueRef = await readIssue(issue.id);
+    await reuse(input, first.persistedExecutionWorkspace!);
+    const next = await prepareHeartbeatWorkspace(db, input);
+    expect(next.persistedExecutionWorkspace).toMatchObject({ id: first.persistedExecutionWorkspace!.id, projectId: null });
+    expect(next.executionWorkspace.cwd).toBe(first.executionWorkspace.cwd);
+    expect(await readFile(join(next.executionWorkspace.cwd, "retained.txt"), "utf8")).toBe("task files");
+    expect((await readIssue(issue.id)).projectId).toBe(organization.id);
   });
 
   it("creates a real isolated worktree and reuses its recorded workspace", async () => {
@@ -132,11 +509,83 @@ describe.skipIf(!support.supported)("heartbeat workspace preparation boundary", 
     await db.update(issues).set({ executionWorkspaceId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
     input.task.issueRef = { ...input.task.issueRef!, executionWorkspaceId: null, projectWorkspaceId: null };
     input.reuse.nativeRecoveryExecutionWorkspaceId = first.persistedExecutionWorkspace!.id;
+    await persistRecoveryInput(input, first.persistedExecutionWorkspace!.id, first.executionWorkspace.cwd);
     const anchor = vi.spyOn(input.services, "resolveReusedGitWorkspaceAnchor");
+    const prepareRepositories = vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission");
+    const reserveRoot = vi.spyOn(input.services.executionWorkspacesSvc, "assertTaskRepositoryRecoveryBinding");
     const next = await prepareHeartbeatWorkspace(db, input);
+    expect(reserveRoot).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
+      workspaceId: first.persistedExecutionWorkspace!.id, cwd: first.executionWorkspace.cwd,
+      agentId: input.agent.id, runId: input.run.id });
+    expect(prepareRepositories).not.toHaveBeenCalled();
     expect(next.persistedExecutionWorkspace!.id).toBe(first.persistedExecutionWorkspace!.id);
     expect(anchor).toHaveBeenCalledWith(expect.objectContaining({ immutableNativeBinding: true, explicitProjectWorkspaceId: first.persistedExecutionWorkspace!.projectWorkspaceId }));
     expect(await readIssue(issue.id)).toMatchObject({ executionWorkspaceId: null, projectWorkspaceId: null });
+  });
+
+  it.each([
+    { transport: "local", descriptor: "absent" },
+    { transport: "ssh", descriptor: "absent" },
+    { transport: "daytona", descriptor: "valid" },
+    { transport: "daytona", descriptor: "absent" },
+    { transport: "daytona", descriptor: "corrupt" },
+  ] as const)("validates the admitted host binding for $transport recovery with $descriptor descriptor", async ({ transport, descriptor }) => {
+    const { input, issue } = await fixture(true);
+    const first = await prepareHeartbeatWorkspace(db, input);
+    await reuse(input, first.persistedExecutionWorkspace!);
+    await db.update(issues).set({ executionWorkspaceId: null, projectWorkspaceId: null }).where(eq(issues.id, issue.id));
+    input.task.issueRef = { ...input.task.issueRef!, executionWorkspaceId: null, projectWorkspaceId: null };
+    input.reuse.nativeRecoveryExecutionWorkspaceId = first.persistedExecutionWorkspace!.id;
+    const admittedRoot = join(home, `admitted-${input.run.id}`);
+    await mkdir(admittedRoot);
+    const remoteCwd = "/remote/admitted-task";
+    await persistRecoveryInput(input, first.persistedExecutionWorkspace!.id, transport === "local" ? admittedRoot : remoteCwd);
+    const target: AdapterExecutionTarget = transport === "local" ? { kind: "local" }
+      : transport === "ssh" ? { kind: "remote", transport: "ssh", remoteCwd,
+        spec: { host: "fixture.invalid", port: 22, username: "fixture", remoteWorkspacePath: remoteCwd,
+          privateKey: null, knownHosts: null, strictHostKeyChecking: true, remoteCwd } }
+      : { kind: "remote", transport: "sandbox", providerKey: "daytona", remoteCwd };
+    const realize = input.services.envOrchestrator.realizeForRun;
+    vi.spyOn(input.services.envOrchestrator, "realizeForRun").mockImplementation(async args => ({
+      ...await realize(args), executionTarget: target,
+    }));
+    if (descriptor !== "absent") {
+      const baseline = await captureDirectorySnapshot(admittedRoot);
+      const reference = await nativeWorkspaceSyncInternals.writeDescriptor({
+        schema: "paperclip.native-workspace-sync/v1", state: "prepared",
+        binding: { companyId: issue.companyId, runId: input.run.id, workspaceId: first.persistedExecutionWorkspace!.id,
+          leaseId: "admitted-lease", providerLeaseId: "admitted-provider", localCwd: admittedRoot, remoteCwd },
+        baseline: serializeDirectorySnapshot(baseline), baselineSha256: directorySnapshotSha256(baseline),
+        gitSnapshot: null, seed: null, createdAt: new Date().toISOString(), finalizedAt: null, finalHostSha256: null, resourceDisposition: null,
+      });
+      input.run.runnerProfileJson = { ...input.run.runnerProfileJson, nativeWorkspaceSync: reference };
+      await db.update(heartbeatRuns).set({ runnerProfileJson: input.run.runnerProfileJson }).where(eq(heartbeatRuns.id, input.run.id));
+      if (descriptor === "corrupt") {
+        await writeFile(nativeWorkspaceSyncInternals.descriptorPath(input.run.id, reference.descriptorSha256), "{}");
+      }
+    }
+    const reserve = vi.spyOn(input.services.executionWorkspacesSvc, "assertTaskRepositoryRecoveryBinding");
+    const prepare = vi.spyOn(input.services.executionWorkspacesSvc, "prepareTaskRepositoriesForAdmission");
+    if (transport !== "daytona" || descriptor === "valid") {
+      const result = await prepareHeartbeatWorkspace(db, input);
+      expect(result.executionTarget).toEqual(target);
+      if (transport === "ssh") expect(reserve).not.toHaveBeenCalled();
+      else expect(reserve).toHaveBeenCalledWith({ companyId: issue.companyId, issueId: issue.id,
+        workspaceId: first.persistedExecutionWorkspace!.id, cwd: admittedRoot, agentId: input.agent.id, runId: input.run.id });
+      if (transport !== "daytona") {
+        await expect(prepareNativeWorkspaceSync({ db, runId: input.run.id, companyId: issue.companyId,
+          workspaceId: first.persistedExecutionWorkspace!.id, workspaceLocalDir: first.executionWorkspace.cwd,
+          target, lease: result.activeEnvironmentLease.lease })).resolves.toBeNull();
+      }
+      expect(admittedRoot).not.toBe(first.executionWorkspace.cwd);
+    } else {
+      await expect(prepareHeartbeatWorkspace(db, input)).rejects.toThrow(descriptor === "absent"
+        ? "native_workspace_sync_descriptor_binding_missing" : "native_workspace_sync_descriptor_digest_mismatch");
+      expect(reserve).not.toHaveBeenCalled();
+      expect(await leases(input.run.id)).toMatchObject([{ status: "active" }]);
+    }
+    expect(prepare).not.toHaveBeenCalled();
+    expect((await readIssue(issue.id)).executionWorkspaceId).toBeNull();
   });
 
   it("removes a newly created worktree when persistence fails and preserves the original error", async () => {

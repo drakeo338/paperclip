@@ -97,8 +97,8 @@ describe("heartbeat workspace module", () => {
     ]);
     expect(firstResult).toMatchObject({ cwd: firstCwd, projectId: "project-one", workspaceId: "workspace-one", source: "project_primary", additionalWorkspaces: [] });
     expect(secondResult).toMatchObject({ cwd: secondCwd, projectId: "project-two", workspaceId: "workspace-two", source: "project_primary", additionalWorkspaces: [] });
-    expect(first.select).toHaveBeenCalledTimes(1);
-    expect(second.select).toHaveBeenCalledTimes(1);
+    expect(first.select).toHaveBeenCalledTimes(2);
+    expect(second.select).toHaveBeenCalledTimes(2);
   });
 
   it("uses the current issue's project and selected workspace over stale context", async () => {
@@ -106,6 +106,7 @@ describe("heartbeat workspace module", () => {
     await fs.mkdir(selectedCwd);
     const database = databaseWithResults(
       [{ projectId: "current-project", projectWorkspaceId: "selected-workspace" }],
+      [{ projectId: "current-project" }],
       [workspace("default-workspace", "current-project", path.join(testRoot, "missing")), workspace("selected-workspace", "current-project", selectedCwd)],
     );
     const result = await createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(
@@ -114,7 +115,46 @@ describe("heartbeat workspace module", () => {
       null,
     );
     expect(result).toMatchObject({ cwd: selectedCwd, projectId: "current-project", workspaceId: "selected-workspace", warnings: [], baseCwdFallback: false });
-    expect(database.select).toHaveBeenCalledTimes(2);
+    expect(database.select).toHaveBeenCalledTimes(4);
+  });
+
+  it("resolves plugin storage without creating or reading a Core checkout", async () => {
+    const missingCwd = path.join(testRoot, "provider-only-repository");
+    const database = databaseWithResults([workspace("remote-source", "project-one", missingCwd)],
+      [{ policy: { storageProviderPluginId: "10000000-0000-4000-8000-000000000001" } }]);
+    const result = await createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(agent(), { projectId: "project-one" }, null);
+    expect(result).toMatchObject({ cwd: "/workspaces/remote-source", workspaceId: "remote-source", projectId: "project-one", source: "project_primary" });
+    expect(await fs.stat(missingCwd).catch(() => null)).toBeNull();
+  });
+
+  it("fails closed with workspace diagnostics when a configured directory is unavailable", async () => {
+    const missingCwd = path.join(testRoot, "missing-configured-workspace");
+    const database = databaseWithResults([workspace("selected", "project-one", missingCwd)]);
+    await expect(createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(
+      agent(), { projectId: "project-one" }, null,
+    )).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: {
+        reason: "configured_workspace_unavailable", resolvedProjectId: "project-one", baseCwdFallback: false,
+      } },
+    });
+    expect(await fs.stat(missingCwd).catch(() => null)).toBeNull();
+  });
+
+  it("retains materialization diagnostics when a configured repository cannot be cloned", async () => {
+    const missingRepo = path.join(testRoot, "missing-repository.git");
+    const database = databaseWithResults([{
+      ...workspace("selected", "project-one", ""), repoUrl: missingRepo, sourceType: "git_remote",
+    }]);
+    await expect(createHeartbeatWorkspaceResolver(database.db).resolveWorkspaceForRun(
+      agent(), { projectId: "project-one" }, null,
+    )).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: {
+        reason: "git_worktree_base_materialization_failed",
+        materializationFailures: [expect.objectContaining({ projectWorkspaceId: "selected", repoUrl: missingRepo, error: expect.any(String) })],
+      } },
+    });
   });
 
   it("retains a valid prior session workspace and falls back when it disappears", async () => {
